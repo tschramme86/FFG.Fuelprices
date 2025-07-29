@@ -4,5 +4,8 @@
 
 airium
 azure-functions
+azure-identity
+azure-storage-blob
+pyconstring
 pandas>=2.3
 lxml>=6.0

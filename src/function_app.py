@@ -1,6 +1,11 @@
 import azure.functions as func
 from airium import Airium
-import datetime
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient, generate_account_sas, ResourceTypes, AccountSasPermissions, ContentSettings
+from datetime import datetime as dt, timedelta, timezone
+from pyconstring import ConnectionString
+from urllib import request;
+import os
 import pytz
 import json
 import logging
@@ -41,7 +46,20 @@ class CachedDict(dict):
 app = func.FunctionApp()
 priceCache = CachedDict()
 
-@app.route(route="api/prices/{icao}", auth_level=func.AuthLevel.ANONYMOUS)
+@app.function_name(name="StaticPricePageUpdater")
+@app.timer_trigger(schedule="0 0 */6 * * *", 
+              arg_name="mytimer",
+              run_on_startup=True)
+def UpdateStaticPricePage(mytimer: func.TimerRequest) -> None:
+    utc_timestamp = dt.now(timezone.utc).isoformat()
+    if mytimer.past_due:
+        logging.info('The timer is past due!')
+    logging.info('UpdateStaticPricePage timer triggered function ran at %s', utc_timestamp)
+    update_cached_price_page()
+
+
+@app.function_name(name="PricesAPI")
+@app.route(route="api/prices/{icao}", auth_level=func.AuthLevel.ADMIN)
 def FuelPrices(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Python HTTP trigger "prices/icao" API function')
     icao = req.route_params.get('icao')
@@ -55,10 +73,53 @@ def FuelPrices(req: func.HttpRequest) -> func.HttpResponse:
              status_code=400
         )
 
+@app.function_name(name="UpdatePricePage")
+@app.route(route="api/updatecache", auth_level=func.AuthLevel.ADMIN)
+def TriggerPricePageUpdate(req: func.HttpRequest) -> func.HttpResponse:
+    """Function to trigger the price page update manually."""
+    logging.info('Triggering price page update...')
+    update_cached_price_page()
+    return func.HttpResponse("Price page update triggered.", status_code=200)
+
+@app.function_name(name="PricesPage")
 @app.route(route="{ignored:maxlength(0)?}", auth_level=func.AuthLevel.ANONYMOUS)
 def FuelPricesPage(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Python HTTP trigger "pricepage" function')
 
+    # read the HTML content from the cached price page
+    url = f"https://ffgbsstorage.z6.web.core.windows.net/index.html"
+    html_content = request.urlopen(url).read().decode('utf-8')
+
+    return func.HttpResponse(html_content, mimetype="text/html", status_code=200)
+
+
+###########################################################################################
+## Helper functions
+
+def update_cached_price_page():
+    # Upload the HTML content to Azure Blob Storage
+    logging.info("Uploading static price page to Azure Blob Storage...")
+
+    cs = ConnectionString.from_string(os.environ['AzureWebJobsStorage'])
+
+    account_name = cs['AccountName']
+    account_url = f"https://{account_name}.blob.core.windows.net"
+
+    sas_token = generate_account_sas(
+        account_name=account_name,
+        account_key=cs['AccountKey'],
+        resource_types=ResourceTypes(service=True, container=True, object=True),
+        permission=AccountSasPermissions(read=True, write=True, list=True, delete=True, create=True),
+        expiry=dt.now(timezone.utc) + timedelta(hours=1))
+
+    blob_service_client = BlobServiceClient(account_url, credential=sas_token)
+    blob_client = blob_service_client.get_blob_client(container="$web", blob="index.html")
+    blob_client.upload_blob(get_prices_page(), blob_type="BlockBlob", 
+                            content_settings=ContentSettings(content_type="text/html"),
+                            overwrite=True)
+
+def get_prices_page():
+    """Returns the HTML content of the fuel prices page."""
     prices_page = FuelPricePage()
     for icao, name in relevant_airports:
         try:
@@ -66,8 +127,10 @@ def FuelPricesPage(req: func.HttpRequest) -> func.HttpResponse:
             prices_page.add_price(prices)
         except Exception as e:
             logging.error(f"Error fetching prices for {icao}: {e}")
-    html_content = prices_page.create_page()
-    return func.HttpResponse(html_content, mimetype="text/html", status_code=200)
+    return prices_page.create_page()
+
+###########################################################################################
+## Classes
 
 class fuel_price:
     def __init__(self, icao, priceUl91, priceSuper, priceAvgas):
@@ -83,7 +146,7 @@ class fuel_price:
             raise ValueError("ICAO must be a valid string")
         
         fn = lambda icao: fuel_price.__for_icao_internal(icao, name)
-        return priceCache.get(icao, fn, duration=60 * 60)
+        return priceCache.get(icao, fn, duration=60 * 10)
 
     def __for_icao_internal(icao: str, name: str = None):
         url = f'https://www.spritpreisliste.de/airports/{icao}'
@@ -148,7 +211,7 @@ class FuelPricePage:
         top3_nonavgas_prices = sorted(self.prices, key=lambda x: x.get_non_avgas_prices()[0] if x.get_non_avgas_prices()[0] is not None else float('inf'))[:3]
 
         # newest timeStamp of all fuel prices
-        newest_timestamp = max(price.timeStamp for price in self.prices) if self.prices else datetime.datetime.now().timestamp()
+        newest_timestamp = max(price.timeStamp for price in self.prices) if self.prices else dt.now().timestamp()
 
         a = Airium()
         a('<!DOCTYPE html>')
@@ -229,6 +292,6 @@ class FuelPricePage:
                     a("abgerufen und können sich jederzeit ändern.")
                 with a.p():
                     a("Letzter Datenabruf: ")
-                    a(datetime.datetime.fromtimestamp(newest_timestamp, pytz.timezone("Europe/Berlin")).strftime('%Y-%m-%d %H:%M:%S'))
+                    a(dt.fromtimestamp(newest_timestamp, pytz.timezone("Europe/Berlin")).strftime('%Y-%m-%d %H:%M:%S'))
         return str(a)
 
